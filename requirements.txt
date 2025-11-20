@@ -2,5 +2,5 @@ fastapi
 uvicorn
 beautifulsoup4
 requests
-chromadb==0.3.29
-sentence-transformers==2.2.2
+sentence-transformers
+numpy
