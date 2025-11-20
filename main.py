@@ -5,48 +5,38 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-from sentence_transformers import SentenceTransformer
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-from transformers import AutoTokenizer
+# -----------------------
+# Lightweight Embedding Model (Render-friendly)
+# -----------------------
+from transformers import AutoTokenizer, AutoModel
+import torch
 
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME)
+
+
+def embed_text(text: str):
+    """Create lightweight embedding using mean pooling."""
+    tokens = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        output = model(**tokens)
+
+    embeddings = output.last_hidden_state.mean(dim=1).squeeze().numpy()
+    return embeddings.tolist()
+
+
+# -----------------------
+# ChromaDB
+# -----------------------
 import chromadb
 from typing import List
 
-# ------------------------------------------------------------
-# FastAPI Setup
-# ------------------------------------------------------------
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class SearchRequest(BaseModel):
-    url: str
-    query: str
-
-
-# ------------------------------------------------------------
-# Embedding Model
-# ------------------------------------------------------------
-
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-embed_model = SentenceTransformer(MODEL_NAME)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-
-# ------------------------------------------------------------
-# ChromaDB Setup (stable + simple)
-# ------------------------------------------------------------
-
 chroma_client = chromadb.Client()
 
+
 def reset_collection():
-    """Recreate collection fresh each search."""
     try:
         chroma_client.delete_collection("html_chunks")
     except:
@@ -57,15 +47,33 @@ def reset_collection():
         metadata={"hnsw:space": "cosine"}
     )
 
+
 collection = reset_collection()
 
+# -----------------------
+# FastAPI Setup
+# -----------------------
 
-# ------------------------------------------------------------
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class SearchRequest(BaseModel):
+    url: str
+    query: str
+
+
+# -----------------------
 # Helper Functions
-# ------------------------------------------------------------
+# -----------------------
 
 def fetch_html(url: str) -> str:
-    """Download HTML from the webpage."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=15)
@@ -76,7 +84,6 @@ def fetch_html(url: str) -> str:
 
 
 def extract_clean_text(html: str) -> str:
-    """Clean page: remove scripts, styles, noscript, etc."""
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["script", "style", "noscript"]):
@@ -84,29 +91,27 @@ def extract_clean_text(html: str) -> str:
 
     parts = []
     for el in soup.find_all(["h1", "h2", "h3", "p", "li"]):
-        t = el.get_text(" ", strip=True)
-        if len(t) > 20:
-            parts.append(t)
+        text = el.get_text(" ", strip=True)
+        if len(text) > 20:
+            parts.append(text)
 
     return "\n".join(parts)
 
 
 def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
-    """Split cleaned text into chunks of max 500 tokens."""
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     chunks = []
 
     for i in range(0, len(token_ids), max_tokens):
         chunk_ids = token_ids[i:i + max_tokens]
-        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
+        chunk_decoded = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+        if chunk_decoded:
+            chunks.append(chunk_decoded)
 
     return chunks
 
 
 def index_chunks(url: str, chunks: List[str]):
-    """Stores chunks in vector DB."""
     global collection
     collection = reset_collection()
 
@@ -115,7 +120,8 @@ def index_chunks(url: str, chunks: List[str]):
 
     parsed = urlparse(url)
     path = parsed.path or "/"
-    embeddings = embed_model.encode(chunks).tolist()
+
+    embeddings = [embed_text(chunk) for chunk in chunks]
 
     ids = [str(i) for i in range(len(chunks))]
     metadatas = [{"url": url, "path": path} for _ in chunks]
@@ -129,11 +135,10 @@ def index_chunks(url: str, chunks: List[str]):
 
 
 def semantic_search(query: str, k: int = 50):
-    """Perform semantic search + sort by relevance + return top 10."""
-    vec = embed_model.encode(query).tolist()
+    query_vec = embed_text(query)
 
     result = collection.query(
-        query_embeddings=[vec],
+        query_embeddings=[query_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
     )
@@ -147,7 +152,7 @@ def semantic_search(query: str, k: int = 50):
 
     ranked = []
     for doc, meta, dist in zip(docs, metas, dists):
-        score = 1 / (1 + float(dist))  # convert distance → relevance score
+        score = 1 / (1 + float(dist))
 
         ranked.append({
             "path": meta.get("path", "/"),
@@ -156,16 +161,14 @@ def semantic_search(query: str, k: int = 50):
             "score": score,
         })
 
-    # ⭐ Sort by descending score
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    # ⭐ Return top 10
     return ranked[:10]
 
 
-# ------------------------------------------------------------
+# -----------------------
 # Routes
-# ------------------------------------------------------------
+# -----------------------
 
 @app.post("/search")
 def search(req: SearchRequest):
