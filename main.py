@@ -5,36 +5,29 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-# -----------------------
-# Lightweight Embedding Model (Render-friendly)
-# -----------------------
-from transformers import AutoTokenizer, AutoModel
-import torch
+# ---- LIGHTWEIGHT MODEL (only this works on Render free ) ----
+from sentence_transformers import SentenceTransformer
+embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(MODEL_NAME)
-
-
-def embed_text(text: str):
-    """Create lightweight embedding using mean pooling."""
-    tokens = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-    with torch.no_grad():
-        output = model(**tokens)
-
-    embeddings = output.last_hidden_state.mean(dim=1).squeeze().numpy()
-    return embeddings.tolist()
-
-
-# -----------------------
-# ChromaDB
-# -----------------------
 import chromadb
 from typing import List
 
-chroma_client = chromadb.Client()
+app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SearchRequest(BaseModel):
+    url: str
+    query: str
+
+
+# ---- ChromaDB setup ----
+chroma_client = chromadb.Client()
 
 def reset_collection():
     try:
@@ -47,32 +40,10 @@ def reset_collection():
         metadata={"hnsw:space": "cosine"}
     )
 
-
 collection = reset_collection()
 
-# -----------------------
-# FastAPI Setup
-# -----------------------
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-class SearchRequest(BaseModel):
-    url: str
-    query: str
-
-
-# -----------------------
-# Helper Functions
-# -----------------------
-
+# ---- Helper functions ----
 def fetch_html(url: str) -> str:
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -91,23 +62,19 @@ def extract_clean_text(html: str) -> str:
 
     parts = []
     for el in soup.find_all(["h1", "h2", "h3", "p", "li"]):
-        text = el.get_text(" ", strip=True)
-        if len(text) > 20:
-            parts.append(text)
+        t = el.get_text(" ", strip=True)
+        if len(t) > 20:
+            parts.append(t)
 
     return "\n".join(parts)
 
 
-def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
+def chunk_text(text: str, max_chars=1200):
     chunks = []
-
-    for i in range(0, len(token_ids), max_tokens):
-        chunk_ids = token_ids[i:i + max_tokens]
-        chunk_decoded = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
-        if chunk_decoded:
-            chunks.append(chunk_decoded)
-
+    for i in range(0, len(text), max_chars):
+        chunk = text[i:i + max_chars].strip()
+        if chunk:
+            chunks.append(chunk)
     return chunks
 
 
@@ -118,13 +85,10 @@ def index_chunks(url: str, chunks: List[str]):
     if not chunks:
         return
 
-    parsed = urlparse(url)
-    path = parsed.path or "/"
-
-    embeddings = [embed_text(chunk) for chunk in chunks]
+    embeddings = embed_model.encode(chunks).tolist()
 
     ids = [str(i) for i in range(len(chunks))]
-    metadatas = [{"url": url, "path": path} for _ in chunks]
+    metadatas = [{"url": url} for _ in chunks]
 
     collection.add(
         ids=ids,
@@ -134,11 +98,11 @@ def index_chunks(url: str, chunks: List[str]):
     )
 
 
-def semantic_search(query: str, k: int = 50):
-    query_vec = embed_text(query)
+def semantic_search(query: str, k: int = 10):
+    vec = embed_model.encode(query).tolist()
 
     result = collection.query(
-        query_embeddings=[query_vec],
+        query_embeddings=[vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
     )
@@ -153,22 +117,16 @@ def semantic_search(query: str, k: int = 50):
     ranked = []
     for doc, meta, dist in zip(docs, metas, dists):
         score = 1 / (1 + float(dist))
-
         ranked.append({
-            "path": meta.get("path", "/"),
             "title": doc[:120] + "...",
+            "path": meta.get("url", ""),
             "html": doc,
             "score": score,
         })
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
-
     return ranked[:10]
 
-
-# -----------------------
-# Routes
-# -----------------------
 
 @app.post("/search")
 def search(req: SearchRequest):
