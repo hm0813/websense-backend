@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-requests
 beautifulsoup4
+requests
+chromadb
 sentence-transformers
-pymilvus[model]
-python-multipart
+transformers
