@@ -3,5 +3,5 @@ uvicorn
 beautifulsoup4
 requests
 chromadb
-sentence-transformers
 transformers
+torch
