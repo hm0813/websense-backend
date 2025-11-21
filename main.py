@@ -4,17 +4,17 @@ from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-from sentence_transformers import SentenceTransformer
-import numpy as np
 
-# ------------------------------------------------------------
-# Fast, lightweight CPU-only embedding model
-# ------------------------------------------------------------
-model = SentenceTransformer("all-MiniLM-L6-v2")    # CPU model, ~90MB
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+
+import chromadb
+from typing import List
 
 # ------------------------------------------------------------
 # FastAPI Setup
 # ------------------------------------------------------------
+
 app = FastAPI()
 
 app.add_middleware(
@@ -30,22 +30,52 @@ class SearchRequest(BaseModel):
 
 
 # ------------------------------------------------------------
+# Embedding Model
+# ------------------------------------------------------------
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+embed_model = SentenceTransformer(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+# ------------------------------------------------------------
+# ChromaDB Setup (stable + simple)
+# ------------------------------------------------------------
+
+chroma_client = chromadb.Client()
+
+def reset_collection():
+    """Recreate collection fresh each search."""
+    try:
+        chroma_client.delete_collection("html_chunks")
+    except:
+        pass
+
+    return chroma_client.get_or_create_collection(
+        name="html_chunks",
+        metadata={"hnsw:space": "cosine"}
+    )
+
+collection = reset_collection()
+
+
+# ------------------------------------------------------------
 # Helper Functions
 # ------------------------------------------------------------
 
 def fetch_html(url: str) -> str:
-    """Download HTML safely."""
+    """Download HTML from the webpage."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=15)
-        res.raise_for_status()
-        return res.text
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.text
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch website: {e}")
 
 
-def extract_clean_text(html: str):
-    """Extract readable text from HTML (headlines, paragraphs, list items)."""
+def extract_clean_text(html: str) -> str:
+    """Clean page: remove scripts, styles, noscript, etc."""
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["script", "style", "noscript"]):
@@ -57,40 +87,79 @@ def extract_clean_text(html: str):
         if len(t) > 20:
             parts.append(t)
 
-    return parts
+    return "\n".join(parts)
 
 
-def embed(texts):
-    """Create embeddings in batch."""
-    return model.encode(texts).tolist()
+def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
+    """Split cleaned text into chunks of max 500 tokens."""
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    chunks = []
+
+    for i in range(0, len(token_ids), max_tokens):
+        chunk_ids = token_ids[i:i + max_tokens]
+        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+
+    return chunks
 
 
-def semantic_search(chunks, query):
-    """Compute cosine similarity manually (no ChromaDB)."""
+def index_chunks(url: str, chunks: List[str]):
+    """Stores chunks in vector DB."""
+    global collection
+    collection = reset_collection()
+
     if not chunks:
-        return []
+        return
 
-    chunk_embeddings = np.array(embed(chunks))
-    query_emb = np.array(embed([query])[0])
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    embeddings = embed_model.encode(chunks).tolist()
 
-    # Cosine similarity
-    similarities = chunk_embeddings @ query_emb / (
-        np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(query_emb)
+    ids = [str(i) for i in range(len(chunks))]
+    metadatas = [{"url": url, "path": path} for _ in chunks]
+
+    collection.add(
+        ids=ids,
+        documents=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
     )
 
-    # Sort highest → lowest
-    ranked = np.argsort(similarities)[::-1][:10]
 
-    results = []
-    for idx in ranked:
-        results.append({
-            "path": "/",
-            "title": chunks[idx][:100] + "...",
-            "html": chunks[idx],
-            "score": float(similarities[idx])
+def semantic_search(query: str, k: int = 50):
+    """Perform semantic search + sort by relevance + return top 10."""
+    vec = embed_model.encode(query).tolist()
+
+    result = collection.query(
+        query_embeddings=[vec],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    if not result["documents"]:
+        return []
+
+    docs = result["documents"][0]
+    metas = result["metadatas"][0]
+    dists = result["distances"][0]
+
+    ranked = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        score = 1 / (1 + float(dist))  # convert distance → relevance score
+
+        ranked.append({
+            "path": meta.get("path", "/"),
+            "title": doc[:120] + "...",
+            "html": doc,
+            "score": score,
         })
 
-    return results
+    # ⭐ Sort by descending score
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    # ⭐ Return top 10
+    return ranked[:10]
 
 
 # ------------------------------------------------------------
@@ -100,10 +169,12 @@ def semantic_search(chunks, query):
 @app.post("/search")
 def search(req: SearchRequest):
     html = fetch_html(req.url)
-    cleaned_chunks = extract_clean_text(html)
+    clean = extract_clean_text(html)
+    chunks = chunk_text(clean)
 
-    results = semantic_search(cleaned_chunks, req.query)
+    index_chunks(req.url, chunks)
 
+    results = semantic_search(req.query)
     return {"results": results}
 
 
