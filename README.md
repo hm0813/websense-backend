@@ -74,3 +74,12 @@ backend/
 │── chroma_db/
 │── README.md
 ```
+
+
+
+## ✨ Part of the WebSense Full-Stack Project
+
+Frontend + main dashboard:
+👉 [https://github.com/hm0813/websense-ai-semantic-search](https://github.com/hm0813/websense-ai-semantic-search)
+
+---
