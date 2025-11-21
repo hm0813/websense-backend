@@ -1,5 +1,5 @@
 
-#  **websense-backend — Semantic Search Backend**
+#  **Websense-backend — Semantic Search Backend**
 
 A FastAPI-based backend service for extracting website HTML, chunking content, generating embeddings, and performing semantic search using ChromaDB.
 
